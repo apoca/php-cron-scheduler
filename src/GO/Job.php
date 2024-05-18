@@ -1,13 +1,16 @@
-<?php namespace GO;
+<?php
 
+namespace GO;
+
+use Redis;
 use DateTime;
 use Exception;
 use InvalidArgumentException;
 
 class Job
 {
-    use Traits\Interval,
-        Traits\Mailer;
+    use Traits\Interval;
+    use Traits\Mailer;
 
     /**
      * Job identifier.
@@ -144,6 +147,27 @@ class Job
     private $outputMode;
 
     /**
+     * Redis client.
+     *
+     * @var Redis
+     */
+    private $redisClient = null;
+
+    /**
+     * Redis prefix.
+     *
+     * @var string
+     */
+    private $redisPrefix = 'cron_lock:';
+
+    /**
+     * Indicates whether the lock was successfully acquired.
+     *
+     * @var bool
+     */
+    private $lockAcquired = false;
+
+    /**
      * Create a new Job instance.
      *
      * @param  string|callable  $command
@@ -216,9 +240,13 @@ class Job
      */
     public function isOverlapping()
     {
-        return $this->lockFile &&
-               file_exists($this->lockFile) &&
-               call_user_func($this->whenOverlapping, filemtime($this->lockFile)) === false;
+        if ($this->redisClient) {
+            $lockKey = $this->redisPrefix . $this->id;
+
+            return $this->redisClient->exists($lockKey);
+        }
+
+        return $this->lockFile && file_exists($this->lockFile);
     }
 
     /**
@@ -259,24 +287,55 @@ class Job
      */
     public function onlyOne($tempDir = null, callable $whenOverlapping = null)
     {
-        if ($tempDir === null || ! is_dir($tempDir)) {
-            $tempDir = $this->tempDir;
+        if ($this->redisClient) {
+            $lockKey = $this->redisPrefix . $this->id;
+            // Atomically set the key if it doesn't exist and set an expiry time (e.g., 3600 seconds)
+            $this->lockAcquired = $this->redisClient->set($lockKey, time(), ['nx', 'ex' => 3600]);
+        } else {
+            // Fallback to file lock mechanism
+            if ($tempDir === null || ! is_dir($tempDir)) {
+                $tempDir = $this->tempDir;
+            }
+
+            $this->lockFile = implode('/', [
+                trim($tempDir),
+                trim($this->id) . '.lock',
+            ]);
+
+            if (! file_exists($this->lockFile)) {
+                // Attempt to create the lock file
+                touch($this->lockFile);
+                $this->lockAcquired = true;
+            }
         }
 
-        $this->lockFile = implode('/', [
-            trim($tempDir),
-            trim($this->id) . '.lock',
-        ]);
+        if (! $this->lockAcquired && $whenOverlapping) {
+            call_user_func($whenOverlapping);
 
-        if ($whenOverlapping) {
-            $this->whenOverlapping = $whenOverlapping;
-        } else {
-            $this->whenOverlapping = function () {
-                return false;
-            };
+            return $this; // Return early if overlap is detected
         }
 
         return $this;
+    }
+
+    /**
+     * Releases the lock for the current job.
+     * This involves deleting the Redis key used for locking or removing the lock file.
+     *
+     * @return void
+     */
+    private function releaseLock()
+    {
+        if ($this->lockAcquired) {
+            if ($this->redisClient) {
+                $lockKey = $this->redisPrefix . $this->id;
+                $this->redisClient->del([$lockKey]);
+            } elseif (file_exists($this->lockFile)) {
+                // Remove the lock file
+                unlink($this->lockFile);
+            }
+            $this->lockAcquired = false; // Reset the lock status
+        }
     }
 
     /**
@@ -347,6 +406,12 @@ class Job
             $this->tempDir = $config['tempDir'];
         }
 
+        // Set the Redis client and prefix
+        if (isset($config['redisClient']) && $config['redisClient'] instanceof Redis) {
+            $this->redisClient = $config['redisClient'];
+            $this->redisPrefix = $config['redisPrefix'] ?? $this->redisPrefix;
+        }
+
         return $this;
     }
 
@@ -370,34 +435,35 @@ class Job
      */
     public function run()
     {
-        // If the truthTest failed, don't run
-        if ($this->truthTest !== true) {
-            return false;
+        // Check if the lock was not acquired, indicating another instance is already running
+        if (! $this->lockAcquired) {
+            return false; // Exit the method without running the job
         }
 
-        // If overlapping, don't run
-        if ($this->isOverlapping()) {
-            return false;
+        try {
+            // This is where you'd execute the compiled command or callable
+            if (is_callable($this->before)) {
+                call_user_func($this->before);
+            }
+
+            $compiled = $this->compile();
+            if (is_callable($compiled)) {
+                $this->output = $this->exec($compiled);
+            } else {
+                exec($compiled, $this->output, $this->returnCode);
+            }
+
+            // Any finalization logic after successful execution
+            $this->finalise();
+        } catch (Exception $e) {
+            // Handle any exceptions that occurred during job execution
+            throw new Exception('An error occurred during job execution: ' . $e->getMessage());
+        } finally {
+            // Always release the lock, regardless of job success or failure
+            $this->releaseLock();
         }
 
-        $compiled = $this->compile();
-
-        // Write lock file if necessary
-        $this->createLockFile();
-
-        if (is_callable($this->before)) {
-            call_user_func($this->before);
-        }
-
-        if (is_callable($compiled)) {
-            $this->output = $this->exec($compiled);
-        } else {
-            exec($compiled, $this->output, $this->returnCode);
-        }
-
-        $this->finalise();
-
-        return true;
+        return true; // Indicate the job was executed (attempted)
     }
 
     /**
@@ -460,6 +526,11 @@ class Job
         }
 
         $this->removeLockFile();
+
+        // Release the lock in case of Redis
+        if ($this->redisClient) {
+            $this->releaseLock();
+        }
 
         return $outputBuffer . (is_string($returnData) ? $returnData : '');
     }
